@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"regexp"
+	"strconv"
 
 	"github.com/thushan/olla/internal/adapter/inspector"
 	"github.com/thushan/olla/internal/adapter/translator"
@@ -110,6 +112,8 @@ func (t *Translator) forEachSystemContentBlock(system interface{}, fn func(block
 	return forEachSystemBlock(system, fn)
 }
 
+var contextOverflowPattern = regexp.MustCompile(`^request \(([0-9]+) tokens\) exceeds the available context size \(([0-9]+) tokens\)(?:, try increasing it)?$`)
+
 // WriteError implements ErrorWriter interface for Anthropic-specific error formatting
 // Formats errors according to Anthropic's error schema
 // See: https://docs.anthropic.com/claude/reference/errors
@@ -117,6 +121,18 @@ func (t *Translator) WriteError(w http.ResponseWriter, err error, statusCode int
 	t.logger.Error("Anthropic request failed",
 		"error", err.Error(),
 		"status", statusCode)
+
+	message := err.Error()
+	if statusCode == http.StatusBadRequest {
+		if counts := contextOverflowPattern.FindStringSubmatch(message); counts != nil {
+			actual, actualErr := strconv.ParseUint(counts[1], 10, 64)
+			limit, limitErr := strconv.ParseUint(counts[2], 10, 64)
+			if actualErr == nil && limitErr == nil && actual > limit {
+				// Anthropic clients recognise this prefix as a recoverable context overflow.
+				message = "prompt is too long: " + message
+			}
+		}
+	}
 
 	// Map HTTP status codes to Anthropic error types.
 	// overloaded_error is reserved for Anthropic's own infrastructure being overloaded;
@@ -146,7 +162,7 @@ func (t *Translator) WriteError(w http.ResponseWriter, err error, statusCode int
 		"type": "error",
 		"error": map[string]interface{}{
 			"type":    errorType,
-			"message": err.Error(),
+			"message": message,
 		},
 	}
 

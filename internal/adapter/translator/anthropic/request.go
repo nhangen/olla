@@ -53,6 +53,9 @@ func (t *Translator) TransformRequest(ctx context.Context, r *http.Request) (*tr
 	openaiReq["model"] = anthropicReq.Model
 	openaiReq["max_tokens"] = anthropicReq.MaxTokens
 	openaiReq["stream"] = anthropicReq.Stream
+	if anthropicReq.Stream {
+		openaiReq["stream_options"] = map[string]interface{}{"include_usage": true}
+	}
 
 	// Optional parameters
 	if anthropicReq.Temperature != nil {
