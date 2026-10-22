@@ -105,6 +105,9 @@ func (s *Service) proxyToSingleEndpoint(ctx context.Context, w http.ResponseWrit
 	// Rewrite model name in request body if this is an alias-resolved request
 	core.RewriteModelForAlias(ctx, r, endpoint)
 
+	// Inject runtime identity for the selected backend
+	core.InjectRuntimeIdentity(ctx, r, endpoint, resolvedModel)
+
 	// log at DEBUG when a model alias rewrite occurred so operators can correlate
 	// the alias name the client sent with the actual model dispatched to the backend
 	if resolvedModel != stats.Model {

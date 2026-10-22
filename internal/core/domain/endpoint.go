@@ -52,6 +52,10 @@ type Endpoint struct {
 	ConsecutiveFailures int
 	BackoffMultiplier   int
 	PreservePath        bool
+	Host                string            `json:"host,omitempty"`
+	Accelerator         string            `json:"accelerator,omitempty"`
+	InferenceEngine     string            `json:"inference_engine,omitempty"`
+	ModelIdentities     map[string]string `json:"model_identities,omitempty"`
 }
 
 func (e *Endpoint) GetURLString() string {

@@ -312,6 +312,10 @@ type EndpointConfig struct {
 	CheckInterval  time.Duration `yaml:"check_interval"`
 	CheckTimeout   time.Duration `yaml:"check_timeout"`
 	PreservePath   bool          `yaml:"preserve_path"`
+	Host            string            `yaml:"host,omitempty"`
+	Accelerator     string            `yaml:"accelerator,omitempty"`
+	InferenceEngine string            `yaml:"inference_engine,omitempty"`
+	ModelIdentities map[string]string `yaml:"model_identities,omitempty"`
 }
 
 // LoggingConfig holds logging configuration

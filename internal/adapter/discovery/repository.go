@@ -202,6 +202,10 @@ func (r *StaticEndpointRepository) LoadFromConfig(ctx context.Context, configs [
 			BackoffMultiplier:     1,
 			NextCheckTime:         now,
 			PreservePath:          cfg.PreservePath,
+			Host:                  cfg.Host,
+			Accelerator:           cfg.Accelerator,
+			InferenceEngine:       cfg.InferenceEngine,
+			ModelIdentities:       cfg.ModelIdentities,
 		}
 
 		if cfg.Auth != nil {

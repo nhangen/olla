@@ -73,6 +73,9 @@ func (s *Service) proxyToSingleEndpoint(ctx context.Context, w http.ResponseWrit
 	// Rewrite model name in request body if this is an alias-resolved request
 	core.RewriteModelForAlias(ctx, r, endpoint)
 
+	// Inject runtime identity for the selected backend
+	core.InjectRuntimeIdentity(ctx, r, endpoint, core.ResolvedModelName(ctx, endpoint, stats.Model))
+
 	proxyReq, err := http.NewRequestWithContext(ctx, r.Method, targetURL.String(), r.Body)
 	if err != nil {
 		s.RecordFailure(ctx, endpoint, core.ResolvedModelName(ctx, endpoint, stats.Model), time.Since(stats.StartTime), err)

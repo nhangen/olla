@@ -271,6 +271,7 @@ func (h *RetryHandler) checkContextCancellation(ctx context.Context) error {
 func (h *RetryHandler) resetRequestBodyForRetry(r *http.Request, bodyBytes []byte, attemptCount int) {
 	if bodyBytes != nil && attemptCount > 0 {
 		r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+		r.ContentLength = int64(len(bodyBytes))
 	}
 }
 
