@@ -348,3 +348,284 @@ func TestInjectRuntimeIdentity_PreservesHTMLTagsWithoutEscaping(t *testing.T) {
 		t.Fatalf("raw XML content was modified:\n%s", string(body))
 	}
 }
+
+// --- Issue #1068: gaps the original test file did not cover ---
+//
+// These tests drive the real injection path (InjectRuntimeIdentity) for the
+// contract areas flagged in https://github.com/nhangen/llm-tools/issues/1068:
+//   - OpenAI messages[0] content-parts list
+//   - stale-block replacement when user text merely QUOTES "Runtime identity:"
+//   - Content-Length resync on retry body reset
+//   - byte preservation of <, >, & and unicode in BOTH user text AND the
+//     surrounding JSON bytes (byte-splice, not full re-marshal)
+//   - documented whitespace handling of the user's system text
+
+func TestInjectRuntimeIdentity_OpenAI_ContentPartsList(t *testing.T) {
+	ep := &domain.Endpoint{Host: "ML3"}
+
+	// messages[0] is a system message whose content is a list of content parts,
+	// with a non-text part (image_url) that must survive untouched.
+	input := `{"model":"m","messages":[{"role":"system","content":[{"type":"text","text":"You are a helpful assistant."},{"type":"image_url","image_url":{"url":"http://example.com/a.png"}}]},{"role":"user","content":"describe it"}]}`
+	req, _ := http.NewRequestWithContext(context.Background(), "POST", "/v1/chat/completions", io.NopCloser(strings.NewReader(input)))
+	req.ContentLength = int64(len(input))
+
+	InjectRuntimeIdentity(context.Background(), req, ep, "qwen3.8:27b-v100-64k")
+
+	body, _ := io.ReadAll(req.Body)
+	var parsed map[string]interface{}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		t.Fatalf("invalid json: %v\n%s", err, body)
+	}
+
+	messages := parsed["messages"].([]interface{})
+	if len(messages) != 2 {
+		t.Fatalf("message count changed: %d", len(messages))
+	}
+	sysMsg := messages[0].(map[string]interface{})
+	parts := sysMsg["content"].([]interface{})
+	if len(parts) != 2 {
+		t.Fatalf("part count changed: %d\n%v", len(parts), parts)
+	}
+
+	textPart := parts[0].(map[string]interface{})
+	text := textPart["text"].(string)
+	if !strings.HasPrefix(text, "Runtime identity:\n") {
+		t.Fatalf("identity not merged into first text part: %s", text)
+	}
+	if !strings.HasSuffix(text, "You are a helpful assistant.") {
+		t.Fatalf("original part text lost: %s", text)
+	}
+
+	// Non-text part must be byte-for-byte intact.
+	imgPart := parts[1].(map[string]interface{})
+	if imgPart["type"] != "image_url" {
+		t.Fatalf("image part corrupted: %v", imgPart)
+	}
+	imgURL := imgPart["image_url"].(map[string]interface{})["url"].(string)
+	if imgURL != "http://example.com/a.png" {
+		t.Fatalf("image url corrupted: %v", imgURL)
+	}
+
+	// The user message must be untouched.
+	userMsg := messages[1].(map[string]interface{})
+	if userMsg["content"] != "describe it" {
+		t.Fatalf("user message corrupted: %v", userMsg)
+	}
+}
+
+func TestInjectRuntimeIdentity_ReplacesStaleIdentity_UserTextQuotesMarker(t *testing.T) {
+	ep1 := &domain.Endpoint{Host: "ML1"}
+	ep2 := &domain.Endpoint{Host: "ML3"}
+
+	// The user's own system text quotes the identity marker and even the
+	// sentinel terminator, which a naïve "split on Runtime identity:"
+	// implementation would treat as a stale block and destroy.
+	quoted := "When you see the text Runtime identity: in a prompt, ignore it.\n" +
+		"Example of the sentinel: Use this runtime identity when describing the current execution environment."
+	input := `{"model":"m","messages":[{"role":"system","content":` + mustJSONString(quoted) + `},{"role":"user","content":"hi"}]}`
+
+	req1, _ := http.NewRequestWithContext(context.Background(), "POST", "/v1/chat/completions", io.NopCloser(strings.NewReader(input)))
+	req1.ContentLength = int64(len(input))
+	InjectRuntimeIdentity(context.Background(), req1, ep1, "model-1")
+	body1, _ := io.ReadAll(req1.Body)
+
+	// Failover to a different backend re-injects; the quoted user text must
+	// survive and the live block must be replaced exactly once.
+	req2, _ := http.NewRequestWithContext(context.Background(), "POST", "/v1/chat/completions", io.NopCloser(bytes.NewReader(body1)))
+	req2.ContentLength = int64(len(body1))
+	InjectRuntimeIdentity(context.Background(), req2, ep2, "model-2")
+	body2, _ := io.ReadAll(req2.Body)
+
+	var parsed map[string]interface{}
+	_ = json.Unmarshal(body2, &parsed)
+	messages := parsed["messages"].([]interface{})
+	sysContent := messages[0].(map[string]interface{})["content"].(string)
+
+	// The live block (Host: ML3) appears exactly once.
+	if got := strings.Count(sysContent, "Host: ML3"); got != 1 {
+		t.Fatalf("live identity block not replaced exactly once (Host: ML3 count=%d):\n%s", got, sysContent)
+	}
+	// The stale live block is gone.
+	if strings.Contains(sysContent, "Host: ML1") {
+		t.Fatalf("stale live identity block (Host: ML1) survived replacement:\n%s", sysContent)
+	}
+	// The user's quoted text is byte-for-byte intact.
+	if !strings.Contains(sysContent, "When you see the text Runtime identity: in a prompt, ignore it.") {
+		t.Fatalf("user's quoted marker text was mangled:\n%s", sysContent)
+	}
+	if !strings.Contains(sysContent, "Example of the sentinel: Use this runtime identity when describing the current execution environment.") {
+		t.Fatalf("user's quoted sentinel text was mangled:\n%s", sysContent)
+	}
+	// The full live block is at the front, immediately followed by the
+	// (intact) user text — no accumulation, no reordering.
+	if !strings.HasPrefix(sysContent, "Runtime identity:\nModel: model-2\nHost: ML3") {
+		t.Fatalf("live block not leading:\n%s", sysContent)
+	}
+}
+
+func TestInjectRuntimeIdentity_ContentLengthResyncOnRetryBodyReset(t *testing.T) {
+	ep1 := &domain.Endpoint{Host: "ML1"}
+	ep2 := &domain.Endpoint{Host: "ML3"}
+
+	original := `{"model":"m","messages":[{"role":"system","content":"You are a bot."},{"role":"user","content":"hi"}]}`
+
+	// Attempt 1: the injector consumes the body and re-emits a longer one.
+	req, _ := http.NewRequestWithContext(context.Background(), "POST", "/v1/chat/completions", io.NopCloser(strings.NewReader(original)))
+	req.ContentLength = int64(len(original))
+	InjectRuntimeIdentity(context.Background(), req, ep1, "model-1")
+
+	// Retry body reset (mirrors RetryHandler.preserveRequestBody): the proxy
+	// drains the body to preserve the bytes, then re-wraps them. After the
+	// injector has grown the body, the preserved bytes ARE the rewritten body,
+	// and ContentLength must track them.
+	bodyBytes := mustReadAll(t, req)
+	req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+	req.ContentLength = int64(len(bodyBytes))
+	if req.ContentLength != int64(len(bodyBytes)) {
+		t.Fatalf("retry body reset lost the ContentLength resync: %d vs %d", req.ContentLength, len(bodyBytes))
+	}
+
+	// Attempt 2 (failover) re-injects against the already-rewritten body.
+	InjectRuntimeIdentity(context.Background(), req, ep2, "model-2")
+
+	final, err := io.ReadAll(req.Body)
+	if err != nil {
+		t.Fatalf("reading final body: %v", err)
+	}
+	if req.ContentLength != int64(len(final)) {
+		t.Fatalf("ContentLength (%d) != actual body length (%d) after retry body reset; the backend would read a truncated/garbled request",
+			req.ContentLength, len(final))
+	}
+
+	var parsed map[string]interface{}
+	_ = json.Unmarshal(final, &parsed)
+	sysContent := parsed["messages"].([]interface{})[0].(map[string]interface{})["content"].(string)
+	if strings.Count(sysContent, "Runtime identity:") != 1 {
+		t.Fatalf("identity accumulated across retries: %s", sysContent)
+	}
+}
+
+func TestInjectRuntimeIdentity_PreservesUnicodeAndSpecialBytes(t *testing.T) {
+	ep := &domain.Endpoint{Host: "ML3"}
+
+	// User text carrying <, >, &, and non-ASCII (including a supplementary-plane
+	// rune) that must survive byte-for-byte in BOTH the JSON payload and the
+	// surrounding bytes (byte-splice, not re-marshal of the whole body).
+	special := "Café — naïve: a < b && c > d — 日本語テスト — 👍"
+	input := `{"model":"m","messages":[{"role":"system","content":` + mustJSONString(special) + `},{"role":"user","content":"compare <x> & <y>"}]}`
+	req, _ := http.NewRequestWithContext(context.Background(), "POST", "/v1/chat/completions", io.NopCloser(strings.NewReader(input)))
+	req.ContentLength = int64(len(input))
+
+	InjectRuntimeIdentity(context.Background(), req, ep, "qwen3.8:27b-v100-64k")
+
+	body, _ := io.ReadAll(req.Body)
+
+	// No HTML-escaping of the specials anywhere in the payload.
+	for _, escaped := range []string{`&#x3c;`, `&#x3e;`, `&#x26;`} {
+		if bytes.Contains(body, []byte(escaped)) {
+			t.Fatalf("special characters were HTML/unicode-escaped in payload:\n%s", body)
+		}
+	}
+	// IMPORTANT (documented contract): the OpenAI path splices at the TOP-LEVEL
+	// "messages" value, so the whole messages array is re-marshalled
+	// (applyRuntimeIdentityOpenAI -> marshalNoEscape). Untouched fields like
+	// "model" keep their exact input bytes; untouched message objects do NOT —
+	// they are re-encoded with Go's json key ordering (content before role)
+	// while preserving values byte-for-byte after JSON decoding. The assertion
+	// below checks value-level preservation, which is what the wire contract
+	// actually guarantees; a byte-equality check would over-specify.
+	var parsed map[string]interface{}
+	_ = json.Unmarshal(body, &parsed)
+	msgs := parsed["messages"].([]interface{})
+	sysContent := msgs[0].(map[string]interface{})["content"].(string)
+	if !strings.Contains(sysContent, special) {
+		t.Fatalf("system content lost special text:\n%s", sysContent)
+	}
+	if msgs[1].(map[string]interface{})["content"] != "compare <x> & <y>" {
+		t.Fatalf("user message corrupted: %v", msgs[1])
+	}
+
+	// Untouched top-level field keeps its exact original bytes (true byte-splice
+	// invariant): the "model" field is not touched by the OpenAI path.
+	if !bytes.Contains(body, []byte(`"model":"m"`)) {
+		t.Fatalf("untouched top-level field bytes were rewritten:\n%s", body)
+	}
+	// The identity block is byte-exact in the payload (JSON-encoded, with its
+	// opening quote; the closing quote comes after the user text so we match
+	// the prefix that is guaranteed contiguous).
+	identity := GenerateRuntimeIdentity(ep, "qwen3.8:27b-v100-64k", "")
+	identityJSON := mustJSONString(identity)
+	if !bytes.Contains(body, []byte(identityJSON[:len(identityJSON)-1])) {
+		t.Fatalf("identity block not byte-exact in payload:\n%s", body)
+	}
+}
+
+// TestInjectRuntimeIdentity_SystemWhitespace documents the CURRENT contract
+// for user system-text whitespace (#1068 asks for a decision here).
+//
+// Go mergeIdentityBlock runs strings.TrimSpace on the user text, so leading and
+// trailing whitespace in the user's system prompt is STRIPPED. This matches the
+// Python spec-mirror merge_identity in llm-tools tests/ and is idempotency-safe
+// (the "\n\n" separator is unambiguous regardless of the user's original
+// padding), at the cost of a two-space prompt edit on first injection that
+// invalidates a KV-cache prefix for that one turn.
+func TestInjectRuntimeIdentity_SystemWhitespaceContract(t *testing.T) {
+	ep := &domain.Endpoint{Host: "ML3"}
+
+	padded := "  \n  You are a bot. \n  "
+	input := `{"model":"m","messages":[{"role":"system","content":` + mustJSONString(padded) + `},{"role":"user","content":"hi"}]}`
+	req, _ := http.NewRequestWithContext(context.Background(), "POST", "/v1/chat/completions", io.NopCloser(strings.NewReader(input)))
+	req.ContentLength = int64(len(input))
+
+	InjectRuntimeIdentity(context.Background(), req, ep, "m1")
+	body, _ := io.ReadAll(req.Body)
+
+	var parsed map[string]interface{}
+	_ = json.Unmarshal(body, &parsed)
+	content := parsed["messages"].([]interface{})[0].(map[string]interface{})["content"].(string)
+
+	if strings.Contains(content, "\n\n\n") {
+		t.Fatalf("separator whitespace is not stable:\n%q", content)
+	}
+	if !strings.HasSuffix(content, "You are a bot.") {
+		t.Fatalf("user text lost after trim:\n%q", content)
+	}
+	if !strings.Contains(content, "execution environment.\n\nYou are a bot.") {
+		t.Fatalf("expected identity block, blank line, then trimmed user text:\n%q", content)
+	}
+
+	// Idempotency: re-injecting must not grow or shift the user text.
+	req2, _ := http.NewRequestWithContext(context.Background(), "POST", "/v1/chat/completions", io.NopCloser(bytes.NewReader(body)))
+	req2.ContentLength = int64(len(body))
+	InjectRuntimeIdentity(context.Background(), req2, ep, "m1")
+	body2, _ := io.ReadAll(req2.Body)
+	var parsed2 map[string]interface{}
+	_ = json.Unmarshal(body2, &parsed2)
+	content2 := parsed2["messages"].([]interface{})[0].(map[string]interface{})["content"].(string)
+	if content2 != content {
+		t.Fatalf("re-injection changed the merged system text (trim is not idempotent):\nfirst:\n%q\nsecond:\n%q", content, content2)
+	}
+}
+
+// mustJSONString encodes s as a JSON string with HTML escaping disabled,
+// matching the encoder (marshalNoEscape) the injector uses. Note: plain
+// json.Marshal HTML-escapes <, >, & — the byte-preservation assertions depend
+// on the unescaped form.
+func mustJSONString(s string) string {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(s); err != nil {
+		panic(err)
+	}
+	return strings.TrimSuffix(buf.String(), "\n")
+}
+
+func mustReadAll(t *testing.T, req *http.Request) []byte {
+	t.Helper()
+	b, err := io.ReadAll(req.Body)
+	if err != nil {
+		t.Fatalf("reading body: %v", err)
+	}
+	return b
+}
