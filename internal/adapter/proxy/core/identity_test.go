@@ -481,9 +481,6 @@ func TestInjectRuntimeIdentity_ContentLengthResyncOnRetryBodyReset(t *testing.T)
 	bodyBytes := mustReadAll(t, req)
 	req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 	req.ContentLength = int64(len(bodyBytes))
-	if req.ContentLength != int64(len(bodyBytes)) {
-		t.Fatalf("retry body reset lost the ContentLength resync: %d vs %d", req.ContentLength, len(bodyBytes))
-	}
 
 	// Attempt 2 (failover) re-injects against the already-rewritten body.
 	InjectRuntimeIdentity(context.Background(), req, ep2, "model-2")
@@ -560,15 +557,17 @@ func TestInjectRuntimeIdentity_PreservesUnicodeAndSpecialBytes(t *testing.T) {
 	}
 }
 
-// TestInjectRuntimeIdentity_SystemWhitespace documents the CURRENT contract
-// for user system-text whitespace (#1068 asks for a decision here).
+// TestInjectRuntimeIdentity_SystemWhitespaceContract documents the CURRENT
+// contract for user system-text whitespace (#1068 asks for a decision here).
 //
 // Go mergeIdentityBlock runs strings.TrimSpace on the user text, so leading and
 // trailing whitespace in the user's system prompt is STRIPPED. This matches the
 // Python spec-mirror merge_identity in llm-tools tests/ and is idempotency-safe
 // (the "\n\n" separator is unambiguous regardless of the user's original
-// padding), at the cost of a two-space prompt edit on first injection that
-// invalidates a KV-cache prefix for that one turn.
+// padding). The trim is per-request and deterministic, so the backend-visible
+// prefix is byte-stable across turns and prompt-cache reuse is unaffected by
+// the trim; the once-only prefix invalidation comes from the injected block
+// itself, not from the trim.
 func TestInjectRuntimeIdentity_SystemWhitespaceContract(t *testing.T) {
 	ep := &domain.Endpoint{Host: "ML3"}
 
